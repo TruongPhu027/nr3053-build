@@ -1,0 +1,36 @@
+#!/bin/sh
+# Thiết lập riêng cho NR3053, chạy một lần ở lần khởi động đầu sau khi flash.
+# Tên bắt đầu bằng "zzz" để chạy sau 99-default-settings-chinese và ghi đè nó.
+
+# Múi giờ và máy chủ giờ Việt Nam (mặc định của bản build là giờ Trung Quốc)
+uci -q batch <<'EOT'
+set system.@system[0].zonename='Asia/Ho Chi Minh'
+set system.@system[0].timezone='<+07>-7'
+delete system.ntp.server
+add_list system.ntp.server='0.vn.pool.ntp.org'
+add_list system.ntp.server='1.asia.pool.ntp.org'
+add_list system.ntp.server='time.google.com'
+add_list system.ntp.server='time.cloudflare.com'
+commit system
+EOT
+
+F=/etc/apk/repositories.d/distfeeds.list
+if [ -f "$F" ]; then
+	# Dùng máy chủ gốc của ImmortalWrt thay cho mirror vsean,
+	# bỏ feed "video" (không tồn tại, làm "apk update" báo lỗi)
+	sed -i -e 's,https://mirrors.vsean.net/openwrt,https://downloads.immortalwrt.org,g' \
+	       -e '/\/video\//d' "$F"
+fi
+
+# Feed kmod build cùng lần với firmware này (khớp kernel), đăng trên GitHub Pages.
+# Bỏ feed kmod chính thức vì kmod trong đó không khớp kernel build riêng.
+KMOD_FEED='@KMOD_FEED@'
+case "$KMOD_FEED" in
+	https://*)
+		[ -f "$F" ] && sed -i '/\/targets\/mediatek\/filogic\/packages\//d' "$F"
+		C=/etc/apk/repositories.d/customfeeds.list
+		grep -qF "$KMOD_FEED" "$C" 2>/dev/null || echo "$KMOD_FEED" >> "$C"
+		;;
+esac
+
+exit 0
