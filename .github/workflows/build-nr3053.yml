@@ -1,0 +1,202 @@
+name: Build NR3053 firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Nhánh mã nguồn chasey-dev/immortalwrt-mt798x-rebase"
+        required: true
+        default: "25.12"
+      all_kmods:
+        description: "Build sẵn mọi kmod để sau này tự cài thêm driver (lâu hơn)"
+        type: boolean
+        default: true
+      publish_kmod_feed:
+        description: "Đăng kmod lên GitHub Pages để router cài bằng apk add (repo phải public, bật Pages)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  SRC_REPO: https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git
+  SRC_DIR: /mnt/work/src
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Lấy file cấu hình trong repo này
+        uses: actions/checkout@v4
+
+      - name: Giải phóng dung lượng máy build
+        run: |
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          sudo apt-get -qq clean
+          df -h / /mnt
+
+      - name: Cài công cụ build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+
+      - name: Lấy mã nguồn ImmortalWrt MT798x
+        run: |
+          sudo mkdir -p /mnt/work
+          sudo chown "$(id -u):$(id -g)" /mnt/work
+          git clone --depth 1 -b "${{ inputs.source_branch }}" "$SRC_REPO" "$SRC_DIR"
+          cd "$SRC_DIR" && git log -1 --format='Commit: %h  %cd  %s'
+
+      - name: Cập nhật feeds
+        working-directory: /mnt/work/src
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Thêm app 5G Modem
+        working-directory: /mnt/work/src
+        run: git clone --depth 1 https://github.com/fildunsky/luci-app-5gmodem.git package/5gmodem
+
+      - name: Chép DTS đã mod và tạo cấu hình
+        working-directory: /mnt/work/src
+        run: |
+          sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/mt7981b-viettel-nr3053.dts" \
+            > target/linux/mediatek/dts-ext/mt7981b-viettel-nr3053.dts
+          sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/sdmc-nr3053.config.txt" > .config
+          sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/nr3053-extra.config" >> .config
+
+          # File thêm vào firmware (múi giờ, feed apk) và địa chỉ feed kmod
+          rm -rf files && cp -a "$GITHUB_WORKSPACE/nr3053/files" files
+          find files -type f -exec sed -i 's/\r$//' {} +
+          FEED=""
+          if [ "${{ inputs.all_kmods }}" = "true" ] && [ "${{ inputs.publish_kmod_feed }}" = "true" ]; then
+            OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr 'A-Z' 'a-z')"
+            FEED="https://${OWNER}.github.io/${GITHUB_REPOSITORY#*/}/kmods/packages.adb"
+          fi
+          sed -i "s|@KMOD_FEED@|${FEED}|" files/etc/uci-defaults/zzz-nr3053-local
+          echo "Feed kmod trong firmware: ${FEED:-không dùng}"
+          sed -i '/CONFIG_ALL_KMODS/d' .config
+          if [ "${{ inputs.all_kmods }}" = "true" ]; then
+            echo 'CONFIG_ALL_KMODS=y' >> .config
+          else
+            echo '# CONFIG_ALL_KMODS is not set' >> .config
+          fi
+          make defconfig
+
+          missing=0
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_viettel_nr3053=y' .config || { echo "::error::Chưa chọn được thiết bị NR3053"; missing=1; }
+          for p in kmod-usb-net-cdc-mbim kmod-usb-serial-option modemmanager luci-app-5gmodem \
+                   kmod-hwmon-pwmfan i2c-tools luci-app-oled; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || { echo "::error::Chưa chọn được gói $p"; missing=1; }
+          done
+          [ "$missing" -eq 0 ]
+          grep -E '^CONFIG_ALL_KMODS' .config || echo "ALL_KMODS: tắt"
+
+      - name: Dùng lại mã nguồn đã tải ở lần trước
+        uses: actions/cache@v4
+        with:
+          path: /mnt/work/src/dl
+          key: dl-${{ inputs.source_branch }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ inputs.source_branch }}-
+
+      - name: Tải mã nguồn các gói
+        working-directory: /mnt/work/src
+        run: |
+          make download -j8 || make download -j1 V=s
+          find dl -size -1024c -type f -print -delete
+
+      - name: Build firmware
+        working-directory: /mnt/work/src
+        run: |
+          echo "Build với $(nproc) luồng"
+          make -j"$(nproc)" BUILD_LOG=1 || make -j1 V=s BUILD_LOG=1
+
+      - name: Gom file kết quả
+        working-directory: /mnt/work/src
+        run: |
+          T=bin/targets/mediatek/filogic
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          cp "$T"/*viettel_nr3053* "$OUT"/
+          cp "$T"/config.buildinfo "$OUT"/ 2>/dev/null || true
+          cp .config "$OUT"/full.config
+          (cd "$OUT" && sha256sum * > sha256sums.txt && md5sum * > md5sums.txt)
+          ls -l "$OUT"
+          if [ "${{ inputs.all_kmods }}" = "true" ] && [ -d "$T/packages" ]; then
+            tar czf "$GITHUB_WORKSPACE/nr3053-kmods.tar.gz" -C "$T" packages
+          fi
+          df -h /mnt
+
+      - name: Chuẩn bị feed kmod cho GitHub Pages
+        if: inputs.all_kmods && inputs.publish_kmod_feed
+        run: |
+          P=/mnt/work/src/bin/targets/mediatek/filogic/packages
+          test -f "$P/packages.adb" || { echo "::error::Không thấy $P/packages.adb"; exit 1; }
+          mkdir -p site/kmods
+          cp -a "$P"/. site/kmods/
+          cp out/md5sums.txt out/sha256sums.txt site/
+          {
+            echo "<h1>NR3053 kmod feed</h1>"
+            echo "<p>Build: ${GITHUB_SHA::7}, run ${GITHUB_RUN_NUMBER}</p>"
+            echo "<p>Feed: <code>kmods/packages.adb</code></p>"
+          } > site/index.html
+          du -sh site
+
+      - name: Tải feed kmod lên Pages
+        if: inputs.all_kmods && inputs.publish_kmod_feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Tải lên firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: nr3053-firmware
+          path: out/
+          retention-days: 30
+
+      - name: Tải lên gói kmod
+        if: inputs.all_kmods
+        uses: actions/upload-artifact@v4
+        with:
+          name: nr3053-kmods
+          path: nr3053-kmods.tar.gz
+          retention-days: 30
+
+      - name: Tải lên log khi build lỗi
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: /mnt/work/src/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  deploy-kmod-feed:
+    needs: build
+    if: inputs.all_kmods && inputs.publish_kmod_feed
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Đăng feed kmod
+        id: deployment
+        uses: actions/deploy-pages@v4
