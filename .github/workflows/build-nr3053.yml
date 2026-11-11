@@ -129,15 +129,33 @@ jobs:
           make -j"$(nproc)" tools/install toolchain/install BUILD_LOG=1 || \
             make -j1 V=s tools/install toolchain/install BUILD_LOG=1
 
-      - name: Build kernel (tự chọn mặc định cho tùy chọn kernel mới)
+      - name: Build kernel (tự điền mặc định cho tùy chọn kernel chưa khai báo)
         working-directory: /mnt/work/src
         run: |
-          # Bật nhiều kmod làm lộ ra các tùy chọn kernel mà cấu hình gốc chưa khai báo,
-          # kernel sẽ dừng lại hỏi (NEW). Bơm sẵn Enter để nó chọn giá trị mặc định.
-          yes '' | make -j"$(nproc)" target/linux/compile BUILD_LOG=1 || \
-            { yes '' | make -j1 V=s target/linux/compile BUILD_LOG=1; }
-          echo "Các tùy chọn kernel đã được tự chọn mặc định:"
-          grep -rh '(NEW)' logs/target/linux/ 2>/dev/null | sed 's/(NEW).*/(NEW)/' | sort -u || true
+          # Lần 1: OpenWrt giải nén, vá và tạo cấu hình kernel. Bật nhiều kmod làm lộ ra
+          # tùy chọn mà cấu hình gốc chưa khai báo (NEW); OpenWrt đặt FAIL_ON_UNCONFIGURED=1
+          # nên kernel dừng ngay thay vì hỏi.
+          if make -j"$(nproc)" target/linux/compile BUILD_LOG=1; then exit 0; fi
+
+          LINUX_DIR="$(ls -d build_dir/target-*/linux-mediatek_filogic/linux-[0-9]*/ | head -n1)"
+          TC_BIN="$(ls -d "$PWD"/staging_dir/toolchain-*/bin | head -n1)"
+          if [ -z "$LINUX_DIR" ] || [ ! -f "$LINUX_DIR/.config" ]; then
+            echo "::error::Không có .config của kernel, lỗi không phải do tùy chọn chưa khai báo"
+            exit 1
+          fi
+          export PATH="$TC_BIN:$PATH"
+          KMAKE="make -C $LINUX_DIR ARCH=arm64 CROSS_COMPILE=aarch64-openwrt-linux-musl-"
+
+          echo "Tùy chọn kernel chưa khai báo, sẽ dùng giá trị mặc định:"
+          $KMAKE -s listnewconfig | tee "$GITHUB_WORKSPACE/kernel-new-options.txt"
+
+          # Điền mặc định cho mọi tùy chọn còn thiếu. Ở lần build sau OpenWrt giữ nguyên
+          # file .config này, vì cấu hình nguồn (.config.set) không đổi so với .config.prev.
+          $KMAKE olddefconfig
+
+          # Lần 2: build kernel với cấu hình đã đầy đủ
+          make -j"$(nproc)" target/linux/compile BUILD_LOG=1 || \
+            make -j1 V=s target/linux/compile BUILD_LOG=1
 
       - name: Build firmware
         working-directory: /mnt/work/src
@@ -155,6 +173,7 @@ jobs:
           cp "$T"/*viettel_nr3053* "$OUT"/
           cp "$T"/config.buildinfo "$OUT"/ 2>/dev/null || true
           cp .config "$OUT"/full.config
+          cp "$GITHUB_WORKSPACE/kernel-new-options.txt" "$OUT"/ 2>/dev/null || true
           (cd "$OUT" && sha256sum * > sha256sums.txt && md5sum * > md5sums.txt)
           ls -l "$OUT"
           if [ "${{ inputs.all_kmods }}" = "true" ] && [ -d "$T/packages" ]; then
