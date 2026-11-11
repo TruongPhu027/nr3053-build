@@ -84,6 +84,22 @@ jobs:
           # Ép PTP nằm sẵn trong kernel (chỉ thêm vài chục KB).
           if [ "${{ inputs.all_kmods }}" = "true" ]; then
             echo 'CONFIG_PTP_1588_CLOCK=y' >> target/linux/mediatek/filogic/config-6.12
+
+            # Một số kmod có trong danh sách nhưng kernel này không build ra file .ko
+            # (driver không có hoặc thiếu phụ thuộc), làm hỏng cả gói package/kernel/linux.
+            # Với kmod phụ (=m) chỉ cảnh báo; kmod nằm trong firmware (=y) vẫn báo lỗi như cũ.
+            python3 - <<'PY'
+          p = "include/kernel.mk"
+          s = open(p).read()
+          old = ("\t\t\t\techo \"ERROR: module '$$$$$$$$mod' is missing.\" >&2; \\\n"
+                 "\t\t\t\texit 1; \\\n")
+          new = ("\t\t\t\techo \"$(if $(filter y,$(CONFIG_PACKAGE_kmod-$(1))),ERROR,WARNING): "
+                 "module '$$$$$$$$mod' is missing.\" >&2; \\\n"
+                 "\t\t\t\t$(if $(filter y,$(CONFIG_PACKAGE_kmod-$(1))),exit 1,true); \\\n")
+          assert old in s, "Không tìm thấy đoạn kiểm tra module trong include/kernel.mk"
+          open(p, "w").write(s.replace(old, new))
+          print("Đã nới kiểm tra module thiếu cho kmod phụ")
+          PY
           fi
           sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/sdmc-nr3053.config.txt" > .config
           sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/nr3053-extra.config" >> .config
@@ -181,6 +197,9 @@ jobs:
           cp "$T"/config.buildinfo "$OUT"/ 2>/dev/null || true
           cp .config "$OUT"/full.config
           cp "$GITHUB_WORKSPACE/kernel-new-options.txt" "$OUT"/ 2>/dev/null || true
+          grep -rhoE "WARNING: module '[^']+' is missing" logs/ 2>/dev/null | sed "s|.*/||; s|' is missing||" \
+            | sort -u > "$OUT"/kmod-missing.txt || true
+          echo "Kmod phụ không có file .ko (gói rỗng): $(wc -l < "$OUT"/kmod-missing.txt)"
           (cd "$OUT" && sha256sum * > sha256sums.txt && md5sum * > md5sums.txt)
           ls -l "$OUT"
           if [ "${{ inputs.all_kmods }}" = "true" ] && [ -d "$T/packages" ]; then
