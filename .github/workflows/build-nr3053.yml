@@ -78,6 +78,13 @@ jobs:
         run: |
           sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/mt7981b-viettel-nr3053.dts" \
             > target/linux/mediatek/dts-ext/mt7981b-viettel-nr3053.dts
+
+          # Build mọi kmod biến PTP thành module, nhưng driver Ethernet MediaTek (nằm sẵn trong
+          # kernel) gọi hàm PTP, nên link vmlinux lỗi "undefined reference to ptp_clock_register".
+          # Ép PTP nằm sẵn trong kernel (chỉ thêm vài chục KB).
+          if [ "${{ inputs.all_kmods }}" = "true" ]; then
+            echo 'CONFIG_PTP_1588_CLOCK=y' >> target/linux/mediatek/filogic/config-6.12
+          fi
           sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/sdmc-nr3053.config.txt" > .config
           sed 's/\r$//' "$GITHUB_WORKSPACE/nr3053/nr3053-extra.config" >> .config
 
